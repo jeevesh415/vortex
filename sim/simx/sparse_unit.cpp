@@ -143,7 +143,130 @@ struct FEDP<vt::uint4, vt::int32>{
   }
 };
 
+// Sparse FEDP: uses metadata to select which values from fragB to use
+// fragA is sparse (2:4), fragB is dense
+// metadata contains bitmasks indicating which 2 of 4 positions are non-zero
+// Each metadata byte is a bitmask where bits 0-3 indicate positions (0-3) that are kept
+// For fp16/bf16: each register has 2 elements, metadata byte covers 4 elements = 2 registers
+// For fp32: each register has 1 element, metadata byte covers 4 elements = 4 registers
+template <typename It, typename Ot>
+struct SparseFEDP {
+  using itype = typename It::dtype;
+  using otype = typename Ot::dtype;
+  static uint32_t eval(const reg_data_t *a_row, const reg_data_t *b_col, uint32_t c_val, const uint32_t* metadata) {
+    constexpr uint32_t i_ratio = sizeof(uint32_t) / sizeof(itype);
+    static_assert(i_ratio * sizeof(itype) == sizeof(uint32_t), "SparseFEDP: tcK * i_ratio must be <= 32");
+    auto acc = bit_cast<otype>(c_val);
+    
+    // Process registers in blocks of 4 elements
+    // Each metadata byte covers 4 elements: for fp16 that's 2 registers, for fp32 that's 4 registers
+    constexpr uint32_t regs_per_block = (i_ratio == 2) ? 2 : 4;
+    
+    for (uint32_t z = 0; z < cfg::tcK; z += regs_per_block) {
+      // Get metadata for this block of 4 elements
+      uint32_t block_idx = z / regs_per_block;
+      uint32_t meta = (block_idx < 8) ? metadata[block_idx] : 0;
+      uint8_t meta_byte = meta & 0xFF;
+      
+      // Process each of the 4 positions in this block
+      for (uint32_t pos = 0; pos < 4; ++pos) {
+        if (meta_byte & (1u << pos)) {
+          // This position is non-zero, find which register and element it corresponds to
+          uint32_t reg_idx = z + (pos / i_ratio);
+          uint32_t elem_idx = pos % i_ratio;
+          
+          if (reg_idx < cfg::tcK) {
+            auto a = reinterpret_cast<const itype *>(&a_row[reg_idx].u32);
+            auto b = reinterpret_cast<const itype *>(&b_col[reg_idx].u32);
+            acc = FMA<It, Ot>::eval(a[elem_idx], b[elem_idx], acc);
+          }
+        }
+      }
+    }
+    return bit_cast<uint32_t>(acc);
+  }
+};
+
+// Specialized version for fp32->fp32: each register contains 1 element
+// Metadata byte encodes which 2 of 4 consecutive elements (across 4 registers) are non-zero
+// The metadata byte is a bitmask where bits 0-3 indicate which positions (0-3) are kept
+template <>
+struct SparseFEDP<vt::fp32, vt::fp32> {
+  static uint32_t eval(const reg_data_t *a_row, const reg_data_t *b_col, uint32_t c_val, const uint32_t* metadata) {
+    auto acc = bit_cast<float>(c_val);
+    
+    // Process registers in groups of 4 (one block of 4 elements = 4 registers)
+    for (uint32_t z = 0; z < cfg::tcK; z += 4) {
+      // Calculate which block this is (each block = 4 registers = 4 elements)
+      uint32_t block_idx = z / 4;
+      
+      // Get metadata for this block
+      // Each metadata uint32_t contains 4 bytes (one per block of 4 elements)
+      uint32_t meta_reg_idx = block_idx / 4;  // Which metadata register (0-7)
+      if (meta_reg_idx >= 8) break;  // Only 8 metadata registers available
+      
+      uint32_t meta = metadata[meta_reg_idx];
+      // Extract the byte for this block (each uint32_t has 4 bytes)
+      uint32_t byte_offset = block_idx % 4;
+      uint8_t meta_byte = (meta >> (byte_offset * 8)) & 0xFF;
+      
+      // Decode which 2 of 4 positions are non-zero
+      // The byte is a bitmask where bits 0-3 indicate which positions (0-3) are kept
+      // For 2:4 sparsity, exactly 2 bits should be set
+      for (uint32_t i = 0; i < 4 && (z + i) < cfg::tcK; ++i) {
+        if (meta_byte & (1u << i)) {
+          // This position is non-zero, multiply and accumulate
+          auto a_val = bit_cast<float>(a_row[z + i].u32);
+          auto b_val = bit_cast<float>(b_col[z + i].u32);
+          acc = FMA<vt::fp32, vt::fp32>::eval(a_val, b_val, acc);
+        }
+      }
+    }
+    return bit_cast<uint32_t>(acc);
+  }
+};
+
 using PFN_FEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t);
+using PFN_SparseFEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t, const uint32_t*);
+
+static PFN_SparseFEDP select_SparseFEDP(uint32_t IT, uint32_t OT) {
+  switch (OT) {
+  case vt::fp32::id:
+    switch (IT) {
+    case vt::fp32::id:
+      return SparseFEDP<vt::fp32, vt::fp32>::eval;
+    case vt::fp16::id:
+      return SparseFEDP<vt::fp16, vt::fp32>::eval;
+    case vt::bf16::id:
+      return SparseFEDP<vt::bf16, vt::fp32>::eval;
+    default:
+      std::cout << "Error: unsupported sparse mma format: " << IT << " -> " << OT << "!" << std::endl;
+      std::abort();
+    }
+    break;
+  case vt::fp16::id:
+    switch (IT) {
+    case vt::fp16::id:
+      return SparseFEDP<vt::fp16, vt::fp16>::eval;
+    default:
+      std::cout << "Error: unsupported sparse mma format: " << IT << " -> " << OT << "!" << std::endl;
+      std::abort();
+    }
+    break;
+  case vt::bf16::id:
+    switch (IT) {
+    case vt::bf16::id:
+      return SparseFEDP<vt::bf16, vt::bf16>::eval;
+    default:
+      std::cout << "Error: unsupported sparse mma format: " << IT << " -> " << OT << "!" << std::endl;
+      std::abort();
+    }
+    break;
+  default:
+    std::cout << "Error: unsupported sparse output type: " << OT << "!" << std::endl;
+    std::abort();
+  }
+}
 
 static PFN_FEDP select_FEDP(uint32_t IT, uint32_t OT) {
   switch (OT) {
@@ -237,30 +360,19 @@ public:
         continue;
       auto trace = input.front();
       int delay = 0;
-      #ifdef EXT_VEGETA_ENABLE
       auto tcu_type = std::get<VegetaTcuType>(trace->op_type);
       switch (tcu_type) {
       case VegetaTcuType::TILE_GEMM_T:
       case VegetaTcuType::TILE_GEMM_U:
       case VegetaTcuType::TILE_GEMM_V:
       case VegetaTcuType::TILE_GEMM_R:
+      case VegetaTcuType::WMMA:
         delay = 4;
         break;
       default:
         std::abort();
       }
       DT(3, simobject_->name() << ": op=" << tcu_type << ", " << *trace);
-      #else
-      auto tcu_type = std::get<TcuType>(trace->op_type);
-      switch (tcu_type) {
-      case TcuType::WMMA:
-        delay = 4;
-        break;
-      default:
-        std::abort();
-      }
-      DT(3, simobject_->name() << ": op=" << tcu_type << ", " << *trace);
-      #endif
       simobject_->Outputs.at(iw).push(trace, 2 + delay);
       input.pop();
     }
@@ -275,11 +387,21 @@ public:
             const std::vector<reg_data_t>& rs2_data,
             const std::vector<reg_data_t>& rs3_data,
             std::vector<reg_data_t>& rd_data,
-            ExeTraceData* trace_data) {
-    __unused(wid);
+            ExeTraceData* trace_data,
+            const uint32_t* metadata) {
     __unused(trace_data);
 
-    auto fedp = select_FEDP(fmt_s, fmt_d);
+    // Use provided metadata from integer registers 0-7 for sparse fragA
+    // If metadata is null, use zeros (dense mode fallback)
+    uint32_t meta[8] = {0};
+    if (metadata != nullptr) {
+      for (uint32_t i = 0; i < 8; ++i) {
+        meta[i] = metadata[i];
+      }
+    }
+    
+    // Use sparse FEDP for sparse-dense GEMM
+    auto sparse_fedp = select_SparseFEDP(fmt_s, fmt_d);
 
     uint32_t a_off = (step_m % cfg::a_sub_blocks) * cfg::a_block_size;
     uint32_t b_off = (step_n % cfg::b_sub_blocks) * cfg::b_block_size;
@@ -288,11 +410,36 @@ public:
       for (uint32_t j = 0; j < cfg::tcN; ++j) {
         auto a_row = rs1_data.data() + a_off + i * cfg::tcK;
         auto b_col = rs2_data.data() + b_off + j * cfg::tcK;
-        auto c_val = rs3_data.at(i * cfg::tcN + j).u32;
-        auto d_val = fedp(a_row, b_col, c_val);
-        rd_data.at(i * cfg::tcN + j).u64 = nan_box(d_val);
+        
+        uint32_t idx = i * cfg::tcN + j;
+        if (idx >= rs3_data.size() || idx >= rd_data.size()) {
+          std::cout << "Error: index out of bounds in sparse_unit wmma: idx=" << idx 
+                    << ", rs3_data.size()=" << rs3_data.size() 
+                    << ", rd_data.size()=" << rd_data.size() << std::endl;
+          std::abort();
+        }
+        
+        auto c_val = rs3_data.at(idx).u32;
+        
+        // Map metadata from fragment registers to K dimension registers
+        // Fragment register r maps to: block_m = r / cfg::k_steps, block_k = r % cfg::k_steps
+        // For K dimension register z, we need fragment register r where block_k corresponds to z
+        uint32_t meta_for_k[8] = {0};
+        for (uint32_t z = 0; z < cfg::tcK && z < 8; ++z) {
+          // Compute which fragment register contains data for K dimension z and M dimension i
+          // Fragment register index = a_off + i * cfg::tcK + z
+          uint32_t frag_reg_idx = a_off + i * cfg::tcK + z;
+          if (frag_reg_idx < 8) {
+            meta_for_k[z] = meta[frag_reg_idx];
+          }
+        }
+        
+        // Perform sparse-dense FEDP: fragA is sparse, fragB is dense
+        // Use metadata to select which values from fragB to multiply
+        auto d_val = sparse_fedp(a_row, b_col, c_val, meta_for_k);
+        rd_data.at(idx).u64 = nan_box(d_val);
 
-        DTH(3, "FEDP: wid=" << wid << ", i=" << i << ", j=" << j << ", m=" << step_m << ", n=" << step_n << ", a_row={" << std::hex);
+        DTH(3, "SparseFEDP: wid=" << wid << ", i=" << i << ", j=" << j << ", m=" << step_m << ", n=" << step_n << ", a_row={" << std::hex);
         for (uint32_t q = 0; q < cfg::tcK; ++q) {
           if (q) DTN(3, ", ");
           DTN(3, "0x" << a_row[q].u32);
@@ -301,6 +448,11 @@ public:
         for (uint32_t q = 0; q < cfg::tcK; ++q) {
           if (q) DTN(3, ", ");
           DTN(3, "0x" << b_col[q].u32);
+        }
+        DTN(3, "}, metadata={");
+        for (uint32_t q = 0; q < 8 && q < cfg::tcK; ++q) {
+          if (q) DTN(3, ", ");
+          DTN(3, "0x" << meta_for_k[q]);
         }
         DTN(3, "}, c_val=0x" << c_val << ", d_val=0x" << d_val << std::dec << std::endl);
       }
@@ -643,6 +795,7 @@ void SparseUnit::wmma(uint32_t wid,
                       const std::vector<reg_data_t>& rs2_data,
                       const std::vector<reg_data_t>& rs3_data,
                       std::vector<reg_data_t>& rd_data,
-                      ExeTraceData* trace_data) {
-  impl_->wmma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data);
+                      ExeTraceData* trace_data,
+                      const uint32_t* metadata) {
+  impl_->wmma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data, metadata);
 }

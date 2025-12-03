@@ -1546,23 +1546,55 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
     }
   },
   [&](VegetaTcuType tcu_type) {
-    auto trace_data = std::make_shared<SparseUnit::ExeTraceData>();
-    trace->data = trace_data;
-    assert(warp.tmask.count() == num_threads);
-    // For now, use default values for fmt_s, fmt_d, step_m, step_n
-    // These may need to be extracted from the instruction in the future
-    uint32_t fmt_s = 0;
-    uint32_t fmt_d = 0;
-    uint32_t step_m = 0;
-    uint32_t step_n = 0;
+    auto tpuArgs = std::get<IntrVegetaTcuArgs>(instrArgs);
     switch (tcu_type) {
     case VegetaTcuType::TILE_GEMM_T:
     case VegetaTcuType::TILE_GEMM_U:
     case VegetaTcuType::TILE_GEMM_V:
     case VegetaTcuType::TILE_GEMM_R:
-      sparse_unit_->wmma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
-      rd_write = true;
+      // TODO: Implement TILE_GEMM execution
+      std::abort();
       break;
+    case VegetaTcuType::WMMA: {
+      auto trace_data = std::make_shared<SparseUnit::ExeTraceData>();
+      trace->data = trace_data;
+      assert(warp.tmask.count() == num_threads);
+      
+      // Get metadata from integer registers a0-a7 (x10-x17) for sparse fragA
+      // These contain metadata values loaded by mma_sync into a0-a7
+      DTH(3, "WMMA: current regfile values:" << std::hex << std::endl);
+      for (uint32_t i = 0; i < 32; ++i) {
+        DTN(3, "  x" << std::setfill('0') << std::setw(2) << i << ": 0x" << warp.ireg_file.at(i).at(0) << std::dec << std::endl);
+      }
+      uint32_t metadata[8] = {0};
+      for (uint32_t reg = 0; reg < 8; ++reg) {
+        // a0-a7 correspond to x10-x17 in RISC-V
+        uint32_t a_reg = 10 + reg;  // a0=10, a1=11, ..., a7=17
+
+        // Get value from integer register a_reg for thread 0 (all threads should have same metadata)
+        if (warp.tmask.test(0) && a_reg < warp.ireg_file.size()) {
+          metadata[reg] = warp.ireg_file.at(a_reg).at(0);
+        }
+      }
+      DTH(3, "WMMA: metadata values:" << std::hex << std::endl);
+      for (uint32_t i = 0; i < 8; ++i) {
+        DTN(3, "  a" << std::setfill('0') << std::setw(1) << i << ": 0x" << metadata[i] << std::dec << std::endl);
+      }
+      // Resize rd_data and rs3_data to accommodate WMMA output (tcM * tcN elements)
+      // For sparse WMMA, we need at least tcM * tcN elements
+      namespace vt = vortex::sparse;
+      using cfg = vt::wmma_config_t<NUM_THREADS>;
+      uint32_t wmma_size = cfg::tcM * cfg::tcN;
+      if (rd_data.size() < wmma_size) {
+        rd_data.resize(wmma_size);
+      }
+      if (rs3_data.size() < wmma_size) {
+        rs3_data.resize(wmma_size);
+      }
+      
+      sparse_unit_->wmma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get(), metadata);
+      rd_write = true;
+    } break;
     default:
       std::abort();
     }

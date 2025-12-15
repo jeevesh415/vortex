@@ -1149,7 +1149,6 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
     } break;
   #endif
   #ifdef EXT_VEGETA_ENABLE
-  
   case 3: {
     switch (funct3) {
     case 0: { // WMMA
@@ -1190,7 +1189,6 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       std::abort();
     }
   } break;
-  
   #endif
     default:
       std::abort();

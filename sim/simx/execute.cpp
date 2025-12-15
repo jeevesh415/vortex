@@ -149,9 +149,15 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
          << ", PC=0x" << std::hex << warp.PC << std::dec << " (#" << instr.getUUID() << ")");
 
   // fetch register values
+#ifdef EXT_VEGETA_ENABLE
   if (rsrc0.type != RegType::None && rsrc0.type != RegType::Tile) fetch_registers(rs1_data, wid, 0, rsrc0);
   if (rsrc1.type != RegType::None && rsrc1.type != RegType::Tile) fetch_registers(rs2_data, wid, 1, rsrc1);
   if (rsrc2.type != RegType::None && rsrc2.type != RegType::Tile) fetch_registers(rs3_data, wid, 2, rsrc2);
+#else
+  if (rsrc0.type != RegType::None) fetch_registers(rs1_data, wid, 0, rsrc0);
+  if (rsrc1.type != RegType::None) fetch_registers(rs2_data, wid, 1, rsrc1);
+  if (rsrc2.type != RegType::None) fetch_registers(rs3_data, wid, 2, rsrc2);
+#endif
 
   uint32_t thread_start = 0;
   for (; thread_start < num_threads; ++thread_start) {
@@ -1546,16 +1552,66 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
     }
   },
   [&](VegetaTcuType tcu_type) {
-    auto tpuArgs = std::get<IntrVegetaTcuArgs>(instrArgs);
     switch (tcu_type) {
-    case VegetaTcuType::TILE_GEMM_T:
-    case VegetaTcuType::TILE_GEMM_U:
-    case VegetaTcuType::TILE_GEMM_V:
-    case VegetaTcuType::TILE_GEMM_R:
-      // TODO: Implement TILE_GEMM execution
-      std::abort();
-      break;
+    case VegetaTcuType::TILE_GEMM_T: {
+      auto trace_data = std::make_shared<SparseUnit::ExeTraceData>();
+      trace->data = trace_data;
+      assert(warp.tmask.count() == num_threads);
+      
+      // Extract tile register indices from instruction
+      uint32_t dst_reg = rdest.idx;
+      uint32_t src1_reg = instr.getSrcReg(0).idx;
+      uint32_t src2_reg = instr.getSrcReg(1).idx;
+      
+      // Dense tile × Dense tile → Tile (T × T → T)
+      sparse_unit_->tile_gemm_t(dst_reg, src1_reg, src2_reg);
+      rd_write = false;  // Writes to tile registers, not scalar registers
+    } break;
+    case VegetaTcuType::TILE_GEMM_U: {
+      auto trace_data = std::make_shared<SparseUnit::ExeTraceData>();
+      trace->data = trace_data;
+      assert(warp.tmask.count() == num_threads);
+      
+      // Extract tile register indices from instruction
+      uint32_t dst_reg = rdest.idx;
+      uint32_t src1_reg = instr.getSrcReg(0).idx;
+      uint32_t src2_reg = instr.getSrcReg(1).idx;
+      
+      // Sparse tile (2:4) × Dense tile → Tile (T × U → T)
+      // Metadata assumed to be in corresponding m-register (same index as src1)
+      sparse_unit_->tile_gemm_u(dst_reg, src1_reg, src2_reg, src1_reg);
+      rd_write = false;
+    } break;
+    case VegetaTcuType::TILE_GEMM_V: {
+      auto trace_data = std::make_shared<SparseUnit::ExeTraceData>();
+      trace->data = trace_data;
+      assert(warp.tmask.count() == num_threads);
+      
+      // Extract tile register indices from instruction
+      uint32_t dst_reg = rdest.idx;
+      uint32_t src1_reg = instr.getSrcReg(0).idx;
+      uint32_t src2_reg = instr.getSrcReg(1).idx;
+      
+      // Sparse tile (1:4) × Dense tile → Tile (T × V → T)
+      sparse_unit_->tile_gemm_v(dst_reg, src1_reg, src2_reg, src1_reg);
+      rd_write = false;
+    } break;
+    case VegetaTcuType::TILE_GEMM_R: {
+      auto trace_data = std::make_shared<SparseUnit::ExeTraceData>();
+      trace->data = trace_data;
+      assert(warp.tmask.count() == num_threads);
+      
+      // Extract tile register indices from instruction
+      uint32_t dst_reg = rdest.idx;
+      uint32_t src1_reg = instr.getSrcReg(0).idx;
+      uint32_t src2_reg = instr.getSrcReg(1).idx;
+      
+      // Row-wise sparse tile × Dense tile → Tile (T × U → U)
+      sparse_unit_->tile_gemm_r(dst_reg, src1_reg, src2_reg, src1_reg);
+      rd_write = false;
+    } break;
     case VegetaTcuType::WMMA: {
+      auto tpuArgs = std::get<IntrVegetaTcuArgs>(instrArgs);
       auto trace_data = std::make_shared<SparseUnit::ExeTraceData>();
       trace->data = trace_data;
       assert(warp.tmask.count() == num_threads);

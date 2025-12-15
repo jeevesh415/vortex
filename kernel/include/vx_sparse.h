@@ -200,57 +200,102 @@ public:
       if constexpr (src_layout == col_major) {
         std::swap(block_row, block_col);
       }
-      // For sparse format: when meta_src is provided, data stride is K/2 (not K)
-      // because each row has K/2 values (2 per block of 4)
-      size_t data_ldm = (meta_src != nullptr) ? (ldm / 2) : ldm;
-      auto base = reinterpret_cast<const input_t*>(src) + block_row * data_ldm + block_col;
       
       // Metadata pointer is pre-offset to tile position (like data pointer)
-      // For metadata: stride is based on number of K-blocks per row in the FULL matrix
-      // This is ldm/4 (K/4), not affected by tile boundaries
       const uint32_t* meta_base = meta_src ? reinterpret_cast<const uint32_t*>(meta_src) : nullptr;
-      // NOTE: meta_ldm uses full matrix K for stride, not tile dimensions
       uint32_t meta_ldm = meta_src ? (ldm / 4) : 0;
       
-      detail::unroll_for<Frag::NR>([&](auto r) {
-        uint32_t block_m  = r / cfg::k_steps;
-        uint32_t block_k  = r % cfg::k_steps;
-        uint32_t elem_row = block_m * m_stride;
-        uint32_t elem_col = block_k * k_stride;
-        uint32_t meta_value = 0;
-
-        if (meta_base) {
-          // Metadata uses ABSOLUTE matrix positions (not tile-relative)
-          // meta_row_base = tile_row (absolute row offset for this tile)
-          // meta_col_base = k_tile (absolute K offset for this tile)
-          uint32_t abs_row = meta_row_base + block_row + elem_row;
-          uint32_t abs_k_block = (meta_col_base / 4) + block_k;  // K-block index in full matrix
+      if (meta_src != nullptr) {
+        // SPARSE LOADING: Use metadata to place values in correct k_step registers
+        // data_ldm is K/2 for sparse (compressed values)
+        size_t data_ldm = ldm / 2;
+        // For sparse, don't add block_col to base - we compute sparse_idx separately
+        auto data_base = reinterpret_cast<const input_t*>(src) + block_row * data_ldm;
+        
+        // First, load metadata for each M row that this thread handles
+        // and distribute sparse values to the correct k_step registers
+        detail::unroll_for<Frag::NR>([&](auto r) {
+          uint32_t block_m  = r / cfg::k_steps;
+          uint32_t block_k  = r % cfg::k_steps;
+          uint32_t elem_row = block_m * m_stride;
           
-          // Metadata is stored in row-major format with meta_ldm entries per row
+          // Get metadata for this row (absolute position in matrix)
+          uint32_t abs_row = meta_row_base + block_row + elem_row;
+          uint32_t abs_k_block = (meta_col_base / 4);  // K-block index for this tile
           const uint32_t *meta_ptr = meta_base + static_cast<size_t>(abs_row) * meta_ldm + abs_k_block;
-          meta_value = *meta_ptr;
-        }
-
-        if constexpr (Frag::Use == matrix_a) {
+          uint32_t meta_value = *meta_ptr;
           dst.metadata[r] = meta_value;
-        }
-        if constexpr (src_layout == col_major) {
-          static_assert(input_is_subbyte == false, "col_major layout is not supported for sub-byte matrix_a");
-          std::swap(elem_row, elem_col);
-          auto ptr = base + elem_row * data_ldm + elem_col;
-          if constexpr (sizeof(vreg_t) == sizeof(input_t) && !input_is_subbyte) {
-            dst.data[r] = *reinterpret_cast<const vreg_t*>(ptr);
-          } else {
-            dst.data[r] = input_acessor_t::pack_row(ptr, data_ldm);
+          
+          // meta_value is a bitmask: bits 0-3 indicate which of 4 K positions have values
+          // block_k indicates which pair of K positions this register is for:
+          //   block_k=0 -> K positions 0,1 (bits 0,1)
+          //   block_k=1 -> K positions 2,3 (bits 2,3)
+          uint8_t meta_byte = meta_value & 0xFF;
+          uint32_t k_start = block_k * cfg::tcK;  // Start K position for this register
+          uint32_t k_end = k_start + cfg::tcK;    // End K position
+          
+          // Count how many sparse values come BEFORE this k_step for this row
+          uint32_t sparse_offset = 0;
+          for (uint32_t pos = 0; pos < k_start; ++pos) {
+            if (meta_byte & (1u << pos)) {
+              sparse_offset++;
+            }
           }
-        } else {
-          // row_major layout
-          // For sparse format, use data_ldm (K/2) instead of ldm (K)
-          auto ptr = base + elem_row * data_ldm + elem_col;
-          assert(reinterpret_cast<uintptr_t>(ptr) % alignof(vreg_t) == 0 && "pointer must be aligned to 4 bytes");
-          dst.data[r] = *reinterpret_cast<const vreg_t *>(ptr);
-        }
-      });
+          
+          // For fp32 with tcK=2, each register holds 1 fp32 value
+          // block_col determines which position within the tcK pair: 0 or 1
+          // So the target K position is: k_start + block_col
+          uint32_t target_pos = k_start + block_col;
+          
+          vreg_t loaded_val = 0.0f;
+          
+          if (target_pos < 4) {
+            // Count sparse values before target_pos to get the sparse index
+            uint32_t sparse_idx = sparse_offset;
+            for (uint32_t pos = k_start; pos < target_pos; ++pos) {
+              if (meta_byte & (1u << pos)) {
+                sparse_idx++;
+              }
+            }
+            
+            // Check if target position has a sparse value
+            if (meta_byte & (1u << target_pos)) {
+              auto ptr = data_base + elem_row * data_ldm + sparse_idx;
+              loaded_val = *ptr;
+            }
+            // else: loaded_val stays 0.0f (position was pruned)
+          }
+          
+          dst.data[r] = loaded_val;
+        });
+      } else {
+        // DENSE LOADING: Original non-sparse path
+        auto base = reinterpret_cast<const input_t*>(src) + block_row * ldm + block_col;
+        
+        detail::unroll_for<Frag::NR>([&](auto r) {
+          uint32_t block_m  = r / cfg::k_steps;
+          uint32_t block_k  = r % cfg::k_steps;
+          uint32_t elem_row = block_m * m_stride;
+          uint32_t elem_col = block_k * k_stride;
+          
+          dst.metadata[r] = 0;
+          
+          if constexpr (src_layout == col_major) {
+            static_assert(input_is_subbyte == false, "col_major layout is not supported for sub-byte matrix_a");
+            std::swap(elem_row, elem_col);
+            auto ptr = base + elem_row * ldm + elem_col;
+            if constexpr (sizeof(vreg_t) == sizeof(input_t) && !input_is_subbyte) {
+              dst.data[r] = *reinterpret_cast<const vreg_t*>(ptr);
+            } else {
+              dst.data[r] = input_acessor_t::pack_row(ptr, ldm);
+            }
+          } else {
+            auto ptr = base + elem_row * ldm + elem_col;
+            assert(reinterpret_cast<uintptr_t>(ptr) % alignof(vreg_t) == 0 && "pointer must be aligned to 4 bytes");
+            dst.data[r] = *reinterpret_cast<const vreg_t *>(ptr);
+          }
+        });
+      }
     } else if constexpr (Frag::Use == matrix_b) {
       // Load column-major matrix B
       uint32_t block_idx = (cfg::b_block_size == NT) ? 0 : (lane / cfg::b_block_size);

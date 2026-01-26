@@ -32,10 +32,13 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
     return;
 
   // Sparse A layout: data (values) first, then metadata (padded to 4-byte alignment)
-  // Values size: (M * K / 2) * sizeof(input_t) bytes
+  // Values size: (M * K * sparsity_degree / 4) * sizeof(input_t) bytes
+  //   - 1:4 sparsity: (M * K / 4) * sizeof(input_t)
+  //   - 2:4 sparsity: (M * K / 2) * sizeof(input_t)
   // Metadata size: (M * K / 4) * sizeof(uint32_t) bytes
   constexpr size_t meta_entry_bytes = sizeof(uint32_t);
-  size_t values_per_row = K / 2;
+  uint32_t sparsity_degree = arg->sparsity_degree;
+  size_t values_per_row = K * sparsity_degree / 4; // K/4 for 1:4, K/2 for 2:4
   size_t values_size = static_cast<size_t>(M) * values_per_row * sizeof(ctx::input_t);
   size_t meta_offset = align_up_size(values_size, meta_entry_bytes);
   const uint8_t *base_ptr = reinterpret_cast<const uint8_t *>(pA_values);
@@ -56,17 +59,17 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
 
     // Base pointers for sparse A data/metadata corresponding to this tile
     size_t row_offset_vals = static_cast<size_t>(tile_row) * values_per_row;
-    size_t col_offset_vals = (k_tile / 4) * 2; // two stored values per 4-column block
+    size_t col_offset_vals = (k_tile / 4) * sparsity_degree; // sparsity_degree stored values per 4-column block
     auto pTileA = pA_values + row_offset_vals + col_offset_vals;
     
     // Pass metadata base pointer (not offset) along with tile position
     // load_matrix_sync will calculate absolute positions
     const void *pTileMeta = reinterpret_cast<const void *>(meta_base);
 
-    ctx::load_matrix_sync(fragA, pTileA, K, pTileMeta, tile_row, k_tile);
+    ctx::load_matrix_sync(fragA, pTileA, K, pTileMeta, tile_row, k_tile, sparsity_degree);
 
     // Matrix multiply-accumulate while fragB stays in registers
-    ctx::mma_sync(fragC, fragA, fragB, fragC);
+    ctx::mma_sync(fragC, fragA, fragB, fragC, sparsity_degree);
   }
 
   auto pTileC = pC + tile_row * N + tile_col;

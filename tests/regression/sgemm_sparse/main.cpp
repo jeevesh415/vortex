@@ -30,6 +30,7 @@ using namespace vortex;
 namespace vt = sparse;
 
 static bool g_enable_sparse = true;
+static uint32_t g_sparsity_degree = 2; // Default: 2:4 sparsity
 
 static size_t align_up(size_t value, size_t alignment) {
   if (alignment == 0)
@@ -362,11 +363,13 @@ static void matmul_cpu_sparseA(
       otype_t*               C,      // [M × N]   output
       const SparseMat&       A,      // sparse-A
       const itype_t*         B,      // [K × N]   dense-B (row major)
-      uint32_t               N)      // number of columns of B/C
+      uint32_t               N,
+      uint32_t               sparsity_degree)      // number of columns of B/C
 {
   const uint32_t M = A.rows;
   const uint32_t K = A.cols;
-  const uint32_t values_per_row = K / 2;
+  // Calculate values_per_row based on sparsity degree: 1:4 -> K/4, 2:4 -> K/2
+  const uint32_t values_per_row = K * sparsity_degree / 4;
   const uint32_t meta_per_row   = K / 4;
   const uint32_t subbytes = 8 / vt::ITYPE::bits;
 
@@ -404,9 +407,10 @@ static void matmul_cpu_sparseA(
 static int verify_sparse_gemm(const SparseMat& A,
                               const std::vector<itype_t>& B,
                               const std::vector<otype_t>& C,
-                              uint32_t N) {
+                              uint32_t N,
+                              uint32_t sparsity_degree) {
   std::vector<otype_t> reference(static_cast<size_t>(A.rows) * N);
-  matmul_cpu_sparseA(reference.data(), A, B.data(), N);
+  matmul_cpu_sparseA(reference.data(), A, B.data(), N, sparsity_degree);
 
   int errors = 0;
   for (size_t i = 0, e = reference.size(); i < e; ++i) {
@@ -419,72 +423,6 @@ static int verify_sparse_gemm(const SparseMat& A,
   }
   return errors;
 }
-/*
-static void matmul_cpu(otype_t *C, const itype_t *A, const itype_t *B, uint32_t M, uint32_t N, uint32_t K) {
-  uint32_t subbytes = 8 / vt::ITYPE::bits;
-  uint32_t KS = subbytes ? (K * subbytes) : K;
-  for (uint32_t m = 0; m < M; ++m) {
-    for (uint32_t n = 0; n < N; ++n) {
-      otype_t sum(0);
-      for (uint32_t k = 0; k < KS; ++k) {
-        auto a = data_accessor_t<vt::ITYPE>::read(A, m * KS + k);
-        auto b = data_accessor_t<vt::ITYPE>::read(B, k * N + n);
-        sum = muladd_t<vt::ITYPE, vt::OTYPE>::eval(a, b, sum);
-      }
-      data_accessor_t<vt::OTYPE>::write(C, m * N + n, sum);
-    }
-  }
-}
-*/
-/*
-static void matmul_cpu_sparseA(
-      otype_t*               C,      // [M × N]   output
-      const SparseMat&       A,      // sparse-A
-      const itype_t*         B,      // [K × N]   dense-B
-      uint32_t               N)      // number of columns of B/C
-{
-  const uint32_t M = A.rows;
-  const uint32_t K = A.cols;
-
-  const uint32_t subbytes = 8 / vt::ITYPE::bits;
-
-  // --- helper lambdas to index sparse arrays by row ---
-  auto row_values = [&](uint32_t m) {
-      return A.values.data() + m * (K / 2);   // two kept per block
-  };
-  auto row_meta   = [&](uint32_t m) {
-      return A.meta  .data() + m * (K / 4);
-  };
-
-  for (uint32_t m = 0; m < M; ++m) {
-
-    const itype_t* Avals = row_values(m);
-    const uint8_t* Ameta = row_meta  (m);
-    size_t         v_idx = 0;                 // cursor inside values[]
-
-    for (uint32_t n = 0; n < N; ++n) {
-      otype_t sum(0);
-      for (uint32_t blk = 0; blk < K; blk += 4) {
-        uint8_t mask = *(Ameta++);
-        assert(mask);
-        for (uint32_t i = 0; i < 4; ++i) {
-          if (mask & (1u << i)) {
-            auto a_val = Avals[v_idx++];
-            uint32_t k  = blk + i;                  // logical K index
-            uint32_t kk = subbytes ? k * subbytes   // packed-layout idx
-                                   : k;
-            auto b_val = data_accessor_t<vt::ITYPE>::read(
-                            B, kk * N + n);
-            sum = muladd_t<vt::ITYPE, vt::OTYPE>::eval(a_val, b_val, sum);
-          }
-        }
-      }
-      data_accessor_t<vt::OTYPE>::write(C, m * N + n, sum);
-    }
-  }
-}*/
-
-///////////////////////////////////////////////////////////////////////////////
 
 const char *kernel_file = "kernel.vxbin";
 
@@ -504,13 +442,13 @@ std::string last_build_options;
 
 static void show_usage() {
   std::cout << "Vortex Sgemm TCU Test." << std::endl;
-  std::cout << "Usage: [-m: m] [-n N] [-k: K] [-s] [-h: help]" << std::endl;
-  std::cout << "  -s  Enable 2:4 structured sparsity " << std::endl;
+  std::cout << "Usage: [-m m] [-n N] [-k K] [-p sparsity] [-h]" << std::endl;
+  std::cout << "  -p  Sparsity degree: 1 for 1:4, 2 for 2:4 [default: 2]" << std::endl;
 }
 
 static void parse_args(int argc, char **argv) {
   int c;
-  while ((c = getopt(argc, argv, "m:n:k:i:o:hs")) != -1) {
+  while ((c = getopt(argc, argv, "m:n:k:i:o:hp:")) != -1) {
     switch (c) {
     case 'm':
       xm = atoi(optarg);
@@ -521,9 +459,13 @@ static void parse_args(int argc, char **argv) {
     case 'k':
       xk = atoi(optarg);
       break;
-    case 's':
-      g_enable_sparse = true;
-      std::cout << "Sparse mode enabled (-s)" << std::endl;
+    case 'p':
+      g_sparsity_degree = atoi(optarg);
+      if (g_sparsity_degree != 1 && g_sparsity_degree != 2) {
+        std::cerr << "Error: Sparsity degree must be 1 (1:4) or 2 (2:4)" << std::endl;
+        show_usage();
+        exit(-1);
+      }
       break;
     case 'h':
       show_usage();
@@ -549,11 +491,14 @@ void cleanup() {
 
 
 static SparseMat pruneAndCompressMatrixA(const std::vector<itype_t>& denseA,
-                                         uint32_t M, uint32_t K) {
+                                         uint32_t M, uint32_t K,
+                                         uint32_t sparsity_degree) {
   SparseMat out;
   out.rows = M;
   out.cols = K;
-  out.values.reserve(M * K / 2); // Select 2 values every 4 values
+  // Reserve space based on sparsity degree: 1:4 -> K/4 values per row, 2:4 -> K/2 values per row
+  uint32_t values_per_block = sparsity_degree;
+  out.values.reserve(M * K * values_per_block / 4);
   out.meta.reserve(M * K / 4); // 1 byte for every 4 values
 
   const itype_t* src = denseA.data();
@@ -565,54 +510,48 @@ static SparseMat pruneAndCompressMatrixA(const std::vector<itype_t>& denseA,
                         src[r * K + c + 2],
                         src[r * K + c + 3]};
 
-      // Randomly select 2 out of 4 positions to keep
+      // Randomly select N out of 4 positions to keep (N = sparsity_degree)
       uint32_t idx[4] = {0, 1, 2, 3};
       // Shuffle the indices
       for (uint32_t i = 3; i > 0; --i) {
         uint32_t j = rand() % (i + 1);
         std::swap(idx[i], idx[j]);
       }
-      // Select first 2 shuffled indices
-      uint8_t keep0 = idx[0];
-      uint8_t keep1 = idx[1];
-
-      // Store values in original order (smaller index first)
-      if (keep0 < keep1) {
-        out.values.push_back(blk[keep0]);
-        out.values.push_back(blk[keep1]);
-      } else {
-        out.values.push_back(blk[keep1]);
-        out.values.push_back(blk[keep0]);
+      
+      // Select first N shuffled indices
+      uint8_t mask = 0;
+      std::vector<uint8_t> kept_indices;
+      
+      if (sparsity_degree == 1) {
+        // 1:4 sparsity - keep only one value
+        uint8_t keep0 = idx[0];
+        kept_indices.push_back(keep0);
+        mask = (1u << keep0);
+      } else { // sparsity_degree == 2
+        // 2:4 sparsity - keep two values
+        uint8_t keep0 = idx[0];
+        uint8_t keep1 = idx[1];
+        kept_indices.push_back(keep0);
+        kept_indices.push_back(keep1);
+        mask = (1u << keep0) | (1u << keep1);
+      }
+      
+      // Sort kept indices to store values in original order
+      std::sort(kept_indices.begin(), kept_indices.end());
+      
+      // Store values in original order (position order)
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (mask & (1u << i)) {
+          out.values.push_back(blk[i]);
+        }
       }
 
-      uint8_t m = (1u << keep0) | (1u << keep1);  // e.g. 0b0101
-      out.meta.push_back(m);
+      out.meta.push_back(mask);
     }
   }
   return out;
 }
 
-void test_pruneA() {
-  const uint32_t M = 4, K = 8;
-  std::vector<itype_t> denseA(M * K);
-  for (auto& v : denseA) v = Comparator<vt::ITYPE>::generate();
-
-  auto spA = pruneAndCompressMatrixA(denseA, M, K);
-
-  std::vector<itype_t> recovered(M * K, 0);
-  size_t v_idx = 0, m_idx = 0;
-  for (uint32_t r = 0; r < M; ++r)
-    for (uint32_t c = 0; c < K; c += 4) {
-      uint8_t m = spA.meta[m_idx++];
-      for (uint32_t i = 0; i < 4; ++i)
-        if (m & (1u << i))
-          recovered[r * K + c + i] = spA.values[v_idx++];
-    }
-
-  for (uint32_t i = 0; i < M * K; ++i)
-    assert(recovered[i] == denseA[i] || recovered[i] == 0); //Either the value is preserved or pruned
-  std::cout << "pruneAndCompressMatrixA passed\n";
-}
 
 
 int main(int argc, char *argv[]) {
@@ -678,15 +617,18 @@ int main(int argc, char *argv[]) {
   kernel_arg.M = M;
   kernel_arg.N = N;
   kernel_arg.K = K;
+  kernel_arg.sparsity_degree = g_sparsity_degree;
 
   // allocate device memory for sparse matrix A
   std::cout << "allocate device memory" << std::endl;
   
   size_t sizeA_sparse = 0;
   // For sparse format: data (values) first, then metadata
-  // Values size: (M * K / 2) * sizeof(itype_t) bytes
+  // Values size: (M * K * sparsity_degree / 4) * sizeof(itype_t) bytes
+  //   - 1:4 sparsity: (M * K / 4) * sizeof(itype_t)
+  //   - 2:4 sparsity: (M * K / 2) * sizeof(itype_t)
   // Metadata size: (M * K / 4) * sizeof(uint8_t) bytes
-  size_t values_size = (M * K / 2) * sizeof(itype_t);
+  size_t values_size = (M * K * g_sparsity_degree / 4) * sizeof(itype_t);
   constexpr size_t meta_entry_bytes = sizeof(uint32_t);
   size_t meta_entries = (M * K / 4);
   size_t meta_size = meta_entries * meta_entry_bytes;
@@ -723,7 +665,9 @@ int main(int argc, char *argv[]) {
   }
 
   // Convert to sparse format
-  auto sparseA = pruneAndCompressMatrixA(h_A_dense, M, K);
+  auto sparseA = pruneAndCompressMatrixA(h_A_dense, M, K, g_sparsity_degree);
+  
+  std::cout << "\nSparsity mode: " << g_sparsity_degree << ":4" << std::endl;
   
   // Print original dense matrix A
   std::cout << "\n=== Original Dense Matrix A (" << M << "x" << K << ") ===" << std::endl;
@@ -758,9 +702,10 @@ int main(int argc, char *argv[]) {
   // Print sparse values
   std::cout << "\n=== Sparse Matrix Values (" << sparseA.values.size() << " elements) ===" << std::endl;
   size_t val_idx = 0;
+  uint32_t values_per_row = K * g_sparsity_degree / 4;
   for (uint32_t m = 0; m < M; ++m) {
     std::cout << "Row " << m << " values: ";
-    for (uint32_t k = 0; k < K / 2; ++k) {
+    for (uint32_t k = 0; k < values_per_row; ++k) {
       if (vt::ITYPE::id == vt::fp32::id) {
         std::cout << std::fixed << std::setprecision(3) << sparseA.values[val_idx++] << " ";
       } else {
@@ -874,7 +819,7 @@ int main(int argc, char *argv[]) {
   RT_CHECK(vx_copy_from_dev(h_C.data(), C_buffer, 0, sizeC_bytes));
 
   std::cout << "verify sparse GEMM result" << std::endl;
-  int errors = verify_sparse_gemm(sparseA, h_B_dense, h_C, N);
+  int errors = verify_sparse_gemm(sparseA, h_B_dense, h_C, N, g_sparsity_degree);
 
   // cleanup
   std::cout << "cleanup" << std::endl;

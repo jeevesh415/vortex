@@ -1175,7 +1175,9 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
             ++steps;
             auto instr = std::allocate_shared<Instr>(instr_pool_, uuid_x, FUType::VEGETA);
             instr->setOpType(VegetaTcuType::WMMA);
-            instr->setArgs(IntrVegetaTcuArgs{fmt_s, fmt_d, m, n});
+            // Sparsity degree will be extracted from register t0 (x5) at execute time
+            // Default to 2 (2:4) if not available, actual value will be read from register
+            instr->setArgs(IntrVegetaTcuArgs{fmt_s, fmt_d, m, n, 2});
             instr->setDestReg(rs3, RegType::Float);
             instr->setSrcReg(0, rs1, RegType::Float);
             instr->setSrcReg(1, rs2, RegType::Float);

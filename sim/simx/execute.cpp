@@ -1636,6 +1636,23 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       for (uint32_t i = 0; i < 8; ++i) {
         DTN(3, "  a" << std::setfill('0') << std::setw(1) << i << ": 0x" << metadata[i] << std::dec << std::endl);
       }
+      
+      // Extract sparsity degree from register t0 (x5)
+      uint32_t sparsity_degree = 2; // default to 2:4
+      const uint32_t t0_reg = 5; // t0 is x5
+      if (warp.tmask.test(0) && t0_reg < warp.ireg_file.size()) {
+        sparsity_degree = static_cast<uint32_t>(warp.ireg_file.at(t0_reg).at(0));
+        // Validate sparsity degree (should be 1 or 2)
+        if (sparsity_degree != 1 && sparsity_degree != 2) {
+          std::cerr << "Warning: Invalid sparsity degree " << sparsity_degree << " in register t0 (x5), using default 2" << std::endl;
+          sparsity_degree = 2;
+        }
+      }
+      
+      // Create updated args with the extracted sparsity degree
+      // Note: The sparsity degree is also used by the hardware instruction via register t0 in mma_sync
+      IntrVegetaTcuArgs updated_args{tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, static_cast<uint32_t>(sparsity_degree)};
+      
       // Resize rd_data and rs3_data to accommodate WMMA output (tcM * tcN elements)
       // For sparse WMMA, we need at least tcM * tcN elements
       namespace vt = vortex::sparse;
@@ -1648,7 +1665,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         rs3_data.resize(wmma_size);
       }
       
-      sparse_unit_->wmma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get(), metadata);
+      sparse_unit_->wmma(wid, updated_args.fmt_s, updated_args.fmt_d, updated_args.step_m, updated_args.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get(), metadata, updated_args.sparsity_degree);
       rd_write = true;
     } break;
     default:

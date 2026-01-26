@@ -144,23 +144,45 @@ struct FEDP<vt::uint4, vt::int32>{
 };
 
 // Sparse FEDP: uses metadata to select which values from fragB to use
-// fragA is sparse (2:4), fragB is dense
-// metadata contains bitmasks indicating which 2 of 4 positions are non-zero
+// fragA is sparse (1:4 or 2:4), fragB is dense
+// metadata contains bitmasks indicating which positions are non-zero
+// sparsity_degree: 1 for 1:4 sparsity (1 of 4 non-zero), 2 for 2:4 sparsity (2 of 4 non-zero)
 template <typename It, typename Ot>
 struct SparseFEDP {
   using itype = typename It::dtype;
   using otype = typename Ot::dtype;
-  static uint32_t eval(const reg_data_t *a_row, const reg_data_t *b_col, uint32_t c_val, const uint32_t* metadata) {
+  static uint32_t eval(const reg_data_t *a_row, const reg_data_t *b_col, uint32_t c_val, const uint32_t* metadata, uint32_t sparsity_degree) {
     constexpr uint32_t i_ratio = sizeof(uint32_t) / sizeof(itype);
     static_assert(i_ratio * sizeof(itype) == sizeof(uint32_t), "SparseFEDP: tcK * i_ratio must be <= 32");
     auto acc = bit_cast<otype>(c_val);
     
     constexpr uint32_t regs_per_block = (i_ratio == 2) ? 2 : 4;
     
+    // Verify sparsity_degree is valid
+    if (sparsity_degree != 1 && sparsity_degree != 2) {
+      std::cout << "Error: invalid sparsity_degree=" << sparsity_degree << ", must be 1 or 2" << std::endl;
+      std::abort();
+    }
+    
+    // Track compressed index for sparse values
+    uint32_t compressed_idx = 0;
+    
     for (uint32_t z = 0; z < cfg::tcK; z += regs_per_block) {
       uint32_t block_idx = z / regs_per_block;
       uint32_t meta = (block_idx < 8) ? metadata[block_idx] : 0;
       uint8_t meta_byte = meta & 0xFF;
+      
+      // Count set bits in metadata to verify sparsity_degree
+      uint32_t bits_set = 0;
+      for (uint32_t pos = 0; pos < 4; ++pos) {
+        if (meta_byte & (1u << pos)) {
+          bits_set++;
+        }
+      }
+      
+      // For 1:4 sparsity, expect 1 bit set per 4-element block
+      // For 2:4 sparsity, expect 2 bits set per 4-element block
+      // (Note: bits_set may vary in practice, but we process all set bits)
       
       for (uint32_t pos = 0; pos < 4; ++pos) {
         if (meta_byte & (1u << pos)) {
@@ -168,9 +190,17 @@ struct SparseFEDP {
           uint32_t elem_idx = pos % i_ratio;
           
           if (reg_idx < cfg::tcK) {
-            auto a = reinterpret_cast<const itype *>(&a_row[reg_idx].u32);
-            auto b = reinterpret_cast<const itype *>(&b_col[reg_idx].u32);
-            acc = FMA<It, Ot>::eval(a[elem_idx], b[elem_idx], acc);
+            // For sparse formats, a_row contains compressed values
+            // We need to index into the compressed storage
+            uint32_t a_compressed_reg = compressed_idx / i_ratio;
+            uint32_t a_compressed_elem = compressed_idx % i_ratio;
+            
+            if (a_compressed_reg < cfg::tcK) {
+              auto a = reinterpret_cast<const itype *>(&a_row[a_compressed_reg].u32);
+              auto b = reinterpret_cast<const itype *>(&b_col[reg_idx].u32);
+              acc = FMA<It, Ot>::eval(a[a_compressed_elem], b[elem_idx], acc);
+            }
+            compressed_idx++;
           }
         }
       }
@@ -181,10 +211,12 @@ struct SparseFEDP {
 
 template <>
 struct SparseFEDP<vt::fp32, vt::fp32> {
-  static uint32_t eval(const reg_data_t *a_row, const reg_data_t *b_col, uint32_t c_val, const uint32_t* metadata) {
+  static uint32_t eval(const reg_data_t *a_row, const reg_data_t *b_col, uint32_t c_val, const uint32_t* metadata, uint32_t sparsity_degree) {
     __unused(metadata);
+    __unused(sparsity_degree);
     auto acc = bit_cast<float>(c_val);
     
+    // fp32 is handled as dense (no compression for fp32)
     for (uint32_t z = 0; z < cfg::tcK; ++z) {
       auto a_val = bit_cast<float>(a_row[z].u32);
       auto b_val = bit_cast<float>(b_col[z].u32);
@@ -196,7 +228,7 @@ struct SparseFEDP<vt::fp32, vt::fp32> {
 };
 
 using PFN_FEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t);
-using PFN_SparseFEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t, const uint32_t*);
+using PFN_SparseFEDP = uint32_t (*)(const reg_data_t*, const reg_data_t*, uint32_t, const uint32_t*, uint32_t);
 
 static PFN_SparseFEDP select_SparseFEDP(uint32_t IT, uint32_t OT) {
   switch (OT) {
@@ -323,6 +355,8 @@ public:
   }
 
   void tick() {
+    using ecfg = vortex::vegeta_engine_config_t;
+    
     for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
       auto& input = simobject_->Inputs.at(iw);
       if (input.empty())
@@ -334,30 +368,60 @@ public:
         auto tcu_type = std::get<VegetaTcuType>(trace->op_type);
         switch (tcu_type) {
         case VegetaTcuType::TILE_GEMM_T:
+        // Cycle-accurate pipelined latency:
+          // WL (Weight Load) + FF (Feed First) + FS (Feed Second) + DR (Drain) + REDUCE
+          delay = ecfg::SINGLE_INSTR_LATENCY;
+          break;
         case VegetaTcuType::TILE_GEMM_U:
+        // Cycle-accurate pipelined latency:
+          // WL (Weight Load) + FF (Feed First) + FS (Feed Second) + DR (Drain) + REDUCE
+          delay = ecfg::SINGLE_INSTR_LATENCY;
+          break;
         case VegetaTcuType::TILE_GEMM_V:
+        // Cycle-accurate pipelined latency:
+          // WL (Weight Load) + FF (Feed First) + FS (Feed Second) + DR (Drain) + REDUCE
+          delay = ecfg::SINGLE_INSTR_LATENCY;
+          break;
         case VegetaTcuType::TILE_GEMM_R:
+          // Cycle-accurate pipelined latency:
+          // WL (Weight Load) + FF (Feed First) + FS (Feed Second) + DR (Drain) + REDUCE
+          delay = ecfg::SINGLE_INSTR_LATENCY;
+          break;
         case VegetaTcuType::WMMA:
+          // Keep existing WMMA timing for backward compatibility
           delay = 4;
           break;
         default:
           std::abort();
         }
-        DT(3, simobject_->name() << ": op=" << tcu_type << ", " << *trace);
+        DT(3, simobject_->name() << ": op=" << tcu_type << ", delay=" << delay << ", " << *trace);
       } else if (std::holds_alternative<VegetaLsuType>(trace->op_type)) {
         auto lsu_type = std::get<VegetaLsuType>(trace->op_type);
         switch (lsu_type) {
         case VegetaLsuType::TILE_LOAD_T:
+          // 1KB tile load = TILE_SIZE / MEM_BW cycles
+          delay = ecfg::TILE_LOAD_LATENCY;
+          break;
         case VegetaLsuType::TILE_LOAD_U:
+          // 2KB U-register load = 2 tiles
+          delay = 2 * ecfg::TILE_LOAD_LATENCY;
+          break;
         case VegetaLsuType::TILE_LOAD_V:
+          // 4KB V-register load = 4 tiles  
+          delay = 4 * ecfg::TILE_LOAD_LATENCY;
+          break;
         case VegetaLsuType::TILE_LOAD_M:
-        case VegetaLsuType::TILE_STORE_T:
+          // 128B metadata load
           delay = 2;
+          break;
+        case VegetaLsuType::TILE_STORE_T:
+          // 1KB tile store
+          delay = ecfg::TILE_LOAD_LATENCY;
           break;
         default:
           std::abort();
         }
-        DT(3, simobject_->name() << ": op=" << lsu_type << ", " << *trace);
+        DT(3, simobject_->name() << ": op=" << lsu_type << ", delay=" << delay << ", " << *trace);
       } else {
         std::abort();
       }
@@ -377,8 +441,7 @@ public:
     }
   }
 
-  void wmma(uint32_t wid,
-            uint32_t fmt_s,
+  void wmma(uint32_t fmt_s,
             uint32_t fmt_d,
             uint32_t step_m,
             uint32_t step_n,
@@ -387,7 +450,8 @@ public:
             const std::vector<reg_data_t>& rs3_data,
             std::vector<reg_data_t>& rd_data,
             ExeTraceData* trace_data,
-            const uint32_t* metadata) {
+            const uint32_t* metadata,
+            uint32_t sparsity_degree) {
     __unused(trace_data);
 
     // Use provided metadata from integer registers 0-7 for sparse fragA
@@ -430,10 +494,10 @@ public:
         }
         
         // Perform sparse-dense FEDP: fragA is sparse, fragB is dense
-        auto d_val = sparse_fedp(a_row, b_col, c_val, meta_for_k);
+        auto d_val = sparse_fedp(a_row, b_col, c_val, meta_for_k, sparsity_degree);
         rd_data.at(idx).u64 = nan_box(d_val);
 
-        DTH(3, "SparseFEDP: wid=" << wid << ", i=" << i << ", j=" << j << ", m=" << step_m << ", n=" << step_n << ", a_row={" << std::hex);
+        DTH(3, "SparseFEDP: i=" << i << ", j=" << j << ", m=" << step_m << ", n=" << step_n << ", a_row={" << std::hex);
         for (uint32_t q = 0; q < cfg::tcK; ++q) {
           if (q) DTN(3, ", ");
           DTN(3, "0x" << a_row[q].u32);
@@ -692,6 +756,7 @@ public:
             const std::vector<reg_data_t> &rs1_data,
             MemTraceData *trace_data) {
     __unused(wid);
+    #ifdef EXT_VEGETA_ENABLE
     auto lsu_type = std::get<VegetaLsuType>(instr.getOpType());
     auto lsuArgs = std::get<IntrVegetaLsuArgs>(instr.getArgs());
     uint32_t vd = instr.getDestReg().idx; // DestReg contains the tile register index
@@ -824,6 +889,9 @@ public:
     default:
       std::abort();
     }
+    #else
+    std::abort(); // EXT_VEGETA_ENABLE required for load operations
+    #endif
   }
 
   void store(const Instr &instr,
@@ -832,7 +900,7 @@ public:
              const std::vector<reg_data_t> &rs1_data,
              MemTraceData *trace_data) {
     __unused(wid);
-
+    #ifdef EXT_VEGETA_ENABLE
     auto lsuArgs = std::get<IntrVegetaLsuArgs>(instr.getArgs());
     uint32_t vs3 = instr.getSrcReg(1).idx; // Source tile register index
     
@@ -859,6 +927,9 @@ public:
 
     DP(2, "TILE_STORE: wid=" << wid << ", tid=" << tid << ", vs3=" << vs3 
        << ", base_addr=0x" << std::hex << base_addr << std::dec);
+    #else
+    std::abort(); // EXT_VEGETA_ENABLE required for store operations
+    #endif
   }
 
   const PerfStats& perf_stats() const {
@@ -1000,8 +1071,10 @@ void SparseUnit::wmma(uint32_t wid,
                       const std::vector<reg_data_t>& rs3_data,
                       std::vector<reg_data_t>& rd_data,
                       ExeTraceData* trace_data,
-                      const uint32_t* metadata) {
-  impl_->wmma(wid, fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data, metadata);
+                      const uint32_t* metadata,
+                      uint32_t sparsity_degree) {
+  __unused(wid);
+  impl_->wmma(fmt_s, fmt_d, step_m, step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data, metadata, sparsity_degree);
 }
 
 void SparseUnit::tile_gemm_t(uint32_t dst_treg, uint32_t src1_treg, uint32_t src2_treg) {

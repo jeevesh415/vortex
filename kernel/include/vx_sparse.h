@@ -186,7 +186,8 @@ public:
       size_t ldm,
       const void *meta_src = nullptr,
       uint32_t meta_row_base = 0,
-      uint32_t meta_col_base = 0) {
+      uint32_t meta_col_base = 0,
+      uint32_t sparsity_degree = 2) {
     uint32_t lane = vx_thread_id();
     if constexpr (Frag::Use == matrix_a) {
       // Load row-major matrix A
@@ -207,8 +208,10 @@ public:
       
       if (meta_src != nullptr) {
         // SPARSE LOADING: Use metadata to place values in correct k_step registers
-        // data_ldm is K/2 for sparse (compressed values)
-        size_t data_ldm = ldm / 2;
+        // data_ldm is K * sparsity_degree / 4 for sparse (compressed values)
+        //   - 1:4 sparsity: ldm / 4 (1 value per 4 positions)
+        //   - 2:4 sparsity: ldm / 2 (2 values per 4 positions)
+        size_t data_ldm = (ldm * sparsity_degree) / 4;
         // For sparse, don't add block_col to base - we compute sparse_idx separately
         auto data_base = reinterpret_cast<const input_t*>(src) + block_row * data_ldm;
         
@@ -390,7 +393,7 @@ public:
   }
 
   template <typename FragD, typename FragA, typename FragB, typename FragC>
-  static __attribute__((always_inline)) void mma_sync(FragD &fragD, const FragA &fragA, const FragB &fragB, const FragC &fragC) {
+  static __attribute__((always_inline)) void mma_sync(FragD &fragD, const FragA &fragA, const FragB &fragB, const FragC &fragC, uint32_t sparsity_degree) {
     static_assert(FragA::Use == matrix_a, "A must be matrix_a");
     static_assert(FragB::Use == matrix_b, "B must be matrix_b");
     static_assert(FragC::Use == accumulator, "C must be accumulator");
@@ -417,6 +420,7 @@ public:
     register uint32_t ma5 __asm__("a5") = m5;
     register uint32_t ma6 __asm__("a6") = m6;
     register uint32_t ma7 __asm__("a7") = m7;
+    register uint32_t sparsity_reg __asm__("t0") = sparsity_degree;
 
     // fragA: caller-saved registers (f0-f7)
     register float fa0 __asm__("f0")  = fragA.data[0];
@@ -459,9 +463,9 @@ public:
       register float fd6 __asm__("f30"); 
       register float fd7 __asm__("f31");
 
-      __asm__ volatile (".insn r %[insn], 0, 3, x%[fmd], x%[fms], x0"
+      __asm__ volatile (".insn r %[insn], 0, 3, x%[fmd], x%[fms], %[sparsity_reg]"
         : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fms]"i"(It::id),
+        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fms]"i"(It::id), [sparsity_reg]"r"(sparsity_reg),
           "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
           "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3), "f"(fb4), "f"(fb5), "f"(fb6), "f"(fb7),
           "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7),
@@ -498,9 +502,9 @@ public:
       register float fd6 __asm__("f16");
       register float fd7 __asm__("f17");
 
-      __asm__ volatile (".insn r %[insn], 0, 3, x%[fmd], x%[fms], x0"
+      __asm__ volatile (".insn r %[insn], 0, 3, x%[fmd], x%[fms], %[sparsity_reg]"
         : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fms]"i"(It::id),
+        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fms]"i"(It::id), [sparsity_reg]"r"(sparsity_reg),
           "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
           "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3),
           "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7),

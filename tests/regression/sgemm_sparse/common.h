@@ -19,6 +19,7 @@ typedef struct {
   uint32_t grid_dim[2];
   uint32_t block_dim[2];
   uint32_t M, N, K;
+  uint32_t sparsity_degree; // 1 for 1:4, 2 for 2:4
   uint64_t A_addr;
   uint64_t B_addr;
   uint64_t C_addr;
